@@ -1,0 +1,119 @@
+name: Submit a skill
+description: Propose a new Claude skill for the library. Your submission will be reviewed before publication.
+title: "[Submission] <short skill name>"
+labels: ["skill-submission", "needs-review"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for contributing! Fill in the fields below and submit.
+        A reviewer will convert your submission into a pull request and run automated checks.
+        You'll be tagged on the PR if any changes are needed.
+
+  - type: input
+    id: skill-name
+    attributes:
+      label: Skill name
+      description: A short, lowercase-hyphenated identifier (e.g. "meeting-notes-formatter", "claims-summary-generator"). No spaces, no capital letters, max 64 characters.
+      placeholder: my-skill-name
+    validations:
+      required: true
+
+  - type: input
+    id: description
+    attributes:
+      label: Short description
+      description: One or two sentences describing what the skill does and when to use it. Max 200 characters for best results.
+      placeholder: Formats meeting transcripts into clean, structured notes with action items and decisions highlighted.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      description: Pick the category that best fits.
+      options:
+        - Code & Development
+        - Document Creation
+        - Communication
+        - Data Analysis
+        - Research
+        - Workflow Automation
+        - Design
+        - Productivity
+    validations:
+      required: true
+
+  - type: dropdown
+    id: occupation
+    attributes:
+      label: Primary occupation / audience
+      description: Who is this skill for?
+      options:
+        - General (everyone)
+        - Engineering
+        - Data & Analytics
+        - Underwriting
+        - Claims
+        - Sales & Brokerage
+        - Marketing & Communications
+        - HR & People Ops
+        - Finance & Accounting
+        - Legal & Compliance
+        - Operations
+        - Executive
+    validations:
+      required: true
+
+  - type: input
+    id: tags
+    attributes:
+      label: Tags (optional)
+      description: Comma-separated keywords for filtering (e.g. "email, formatting, productivity"). Leave blank if unsure.
+      placeholder: tag1, tag2, tag3
+
+  - type: textarea
+    id: instructions
+    attributes:
+      label: Skill instructions
+      description: |
+        The actual instructions Claude will follow. Write in plain English — no YAML, no frontmatter. Include:
+        - What the skill does
+        - When Claude should use it
+        - Step-by-step guidance if helpful
+        - Examples of input/output
+      placeholder: |
+        # My Skill
+
+        This skill helps with...
+
+        ## When to use
+        Use this skill when the user asks for...
+
+        ## Instructions
+        1. First, do X
+        2. Then, do Y
+        ...
+      render: markdown
+    validations:
+      required: true
+
+  - type: input
+    id: submitter-name
+    attributes:
+      label: Your name
+      description: So we can credit you. (Your GitHub username is captured automatically.)
+      placeholder: Jane Doe
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Acknowledgements
+      options:
+        - label: I confirm this skill contains no customer data, PHI, policy numbers, or other confidential information.
+          required: true
+        - label: I understand this submission will be reviewed and may be edited before publication.
+          required: true
