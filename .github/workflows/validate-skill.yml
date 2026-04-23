@@ -1,0 +1,329 @@
+name: Validate skill submission
+
+on:
+  pull_request:
+    paths:
+      - 'skills/**/SKILL.md'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # needed for duplicate detection against main
+
+      - name: Find changed skill files
+        id: changed
+        run: |
+          # Get all changed SKILL.md files in this PR
+          FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep 'skills/.*/SKILL\.md$' || true)
+          echo "Changed files:"
+          echo "$FILES"
+          # Save as multiline output
+          {
+            echo 'files<<EOF'
+            echo "$FILES"
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
+          if [ -z "$FILES" ]; then
+            echo "no_files=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Exit early if no skill files changed
+        if: steps.changed.outputs.no_files == 'true'
+        run: |
+          echo "No SKILL.md files changed; nothing to validate."
+          exit 0
+
+      - name: Setup Node
+        if: steps.changed.outputs.no_files != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install validation tools
+        if: steps.changed.outputs.no_files != 'true'
+        run: |
+          npm install --no-save \
+            js-yaml@4 \
+            markdownlint-cli2@0.13 \
+            string-similarity@4
+
+      - name: Check 1 — Schema validation
+        if: steps.changed.outputs.no_files != 'true'
+        id: schema
+        run: |
+          echo "::group::Schema validation"
+          FAIL=0
+          FAILURES=""
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            echo "Checking $file"
+            RESULT=$(node -e "
+              const fs = require('fs');
+              const yaml = require('js-yaml');
+              const content = fs.readFileSync('$file', 'utf8');
+              const match = content.match(/^---\n([\s\S]*?)\n---/);
+              if (!match) { console.log('ERROR: No YAML frontmatter found'); process.exit(1); }
+              let fm;
+              try { fm = yaml.load(match[1]); }
+              catch (e) { console.log('ERROR: Invalid YAML: ' + e.message); process.exit(1); }
+              const errors = [];
+              if (!fm.name) errors.push('Missing required field: name');
+              else if (!/^[a-z0-9][a-z0-9-]*\$/.test(fm.name)) errors.push('name must be lowercase alphanumeric with hyphens');
+              else if (fm.name.length > 64) errors.push('name must be 64 characters or fewer');
+              if (!fm.description) errors.push('Missing required field: description');
+              else if (fm.description.length > 1024) errors.push('description must be 1024 characters or fewer');
+              if (fm.status && !['draft', 'approved', 'deprecated'].includes(fm.status)) {
+                errors.push('status must be one of: draft, approved, deprecated');
+              }
+              if (errors.length) { console.log('ERROR: ' + errors.join('; ')); process.exit(1); }
+              console.log('OK');
+            " 2>&1 || true)
+            if [[ "$RESULT" == ERROR* ]]; then
+              FAIL=1
+              FAILURES="${FAILURES}- \`$file\`: ${RESULT#ERROR: }\n"
+            fi
+          done <<< "${{ steps.changed.outputs.files }}"
+          echo "::endgroup::"
+          if [ "$FAIL" -eq 1 ]; then
+            echo "schema_failures<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$FAILURES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Check 2 — Secret scanning (Gitleaks)
+        if: steps.changed.outputs.no_files != 'true' && (success() || failure())
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false
+          GITLEAKS_ENABLE_SUMMARY: true
+
+      - name: Check 3 — Markdown lint
+        if: steps.changed.outputs.no_files != 'true' && (success() || failure())
+        id: markdown
+        continue-on-error: true
+        run: |
+          echo "::group::Markdown lint"
+          # Lenient config: focus on parseability, not style
+          cat > /tmp/.markdownlint.json <<'EOF'
+          {
+            "default": true,
+            "MD013": false,
+            "MD033": false,
+            "MD041": false,
+            "MD024": { "siblings_only": true },
+            "MD029": false,
+            "MD036": false
+          }
+          EOF
+          FAIL=0
+          OUTPUT=""
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            RESULT=$(npx markdownlint-cli2 --config /tmp/.markdownlint.json "$file" 2>&1 || true)
+            if [ -n "$RESULT" ] && [[ "$RESULT" != *"Summary: 0 error(s)"* ]]; then
+              # Strip paths noise for readability
+              CLEAN=$(echo "$RESULT" | grep -E "^$file:" || echo "$RESULT")
+              if [ -n "$CLEAN" ]; then
+                OUTPUT="${OUTPUT}\n${CLEAN}"
+                FAIL=1
+              fi
+            fi
+          done <<< "${{ steps.changed.outputs.files }}"
+          echo "::endgroup::"
+          if [ "$FAIL" -eq 1 ]; then
+            echo "markdown_issues<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$OUTPUT" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check 4 — Prompt injection patterns
+        if: steps.changed.outputs.no_files != 'true' && (success() || failure())
+        id: injection
+        continue-on-error: true
+        run: |
+          echo "::group::Prompt injection scan"
+          WARNINGS=""
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            CONTENT=$(cat "$file")
+            # Unicode Tag characters (invisible instruction injection)
+            if echo "$CONTENT" | grep -Pq '[\x{E0000}-\x{E007F}]'; then
+              WARNINGS="${WARNINGS}- \`$file\`: Contains invisible Unicode Tag characters (U+E0000–U+E007F). These are commonly used to hide instructions.\n"
+            fi
+            # Known injection phrases (case-insensitive)
+            if echo "$CONTENT" | grep -iPq 'ignore (all|your|the) (previous|prior|above|earlier) (instruction|rule|direction|guideline|system)'; then
+              WARNINGS="${WARNINGS}- \`$file\`: Contains phrase matching 'ignore previous instructions' pattern. If this is intentional (e.g., a skill about prompt engineering), a reviewer can override.\n"
+            fi
+            if echo "$CONTENT" | grep -iPq '(disregard|forget|override) (all|your|the|previous)'; then
+              WARNINGS="${WARNINGS}- \`$file\`: Contains phrase matching 'disregard/forget previous' pattern.\n"
+            fi
+            # Suspiciously long base64-like blocks (>120 continuous base64 chars)
+            if echo "$CONTENT" | grep -Pq '[A-Za-z0-9+/]{120,}={0,2}'; then
+              WARNINGS="${WARNINGS}- \`$file\`: Contains a long base64-like string. Could be hidden content; verify intent.\n"
+            fi
+            # System prompt leak attempts
+            if echo "$CONTENT" | grep -iPq '(reveal|show|print|output) (your|the) (system prompt|instructions)'; then
+              WARNINGS="${WARNINGS}- \`$file\`: References to revealing system prompt. Verify this is a legitimate prompt-engineering skill.\n"
+            fi
+          done <<< "${{ steps.changed.outputs.files }}"
+          echo "::endgroup::"
+          if [ -n "$WARNINGS" ]; then
+            echo "injection_warnings<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$WARNINGS" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check 5 — Duplicate detection
+        if: steps.changed.outputs.no_files != 'true' && (success() || failure())
+        id: duplicates
+        continue-on-error: true
+        run: |
+          echo "::group::Duplicate detection"
+          MATCHES=""
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            RESULT=$(node -e "
+              const fs = require('fs');
+              const path = require('path');
+              const yaml = require('js-yaml');
+              const sim = require('string-similarity');
+
+              function extract(p) {
+                const c = fs.readFileSync(p, 'utf8');
+                const m = c.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+                if (!m) return null;
+                let fm;
+                try { fm = yaml.load(m[1]); } catch { return null; }
+                return {
+                  name: fm?.name || path.basename(path.dirname(p)),
+                  description: fm?.description || '',
+                  body: m[2].slice(0, 2000)
+                };
+              }
+
+              const target = extract('$file');
+              if (!target) { console.log(''); process.exit(0); }
+
+              // Compare against every OTHER skill on main
+              const skillsDir = 'skills';
+              const others = fs.readdirSync(skillsDir)
+                .map(d => path.join(skillsDir, d, 'SKILL.md'))
+                .filter(p => fs.existsSync(p) && p !== '$file')
+                .map(p => ({ path: p, data: extract(p) }))
+                .filter(x => x.data);
+
+              const matches = others
+                .map(o => ({
+                  path: o.path,
+                  nameSim: sim.compareTwoStrings(target.name, o.data.name),
+                  descSim: sim.compareTwoStrings(target.description, o.data.description),
+                  bodySim: sim.compareTwoStrings(target.body, o.data.body)
+                }))
+                .map(m => ({ ...m, combined: (m.nameSim * 0.3 + m.descSim * 0.3 + m.bodySim * 0.4) }))
+                .filter(m => m.combined > 0.5)
+                .sort((a, b) => b.combined - a.combined)
+                .slice(0, 3);
+
+              matches.forEach(m => {
+                const pct = Math.round(m.combined * 100);
+                console.log(\`SIMILAR \${pct}% \${m.path}\`);
+              });
+            " 2>&1)
+            if [ -n "$RESULT" ]; then
+              MATCHES="${MATCHES}\n**Potential duplicates for \`$file\`:**\n"
+              while IFS= read -r match; do
+                if [[ "$match" == SIMILAR* ]]; then
+                  PCT=$(echo "$match" | awk '{print $2}')
+                  PATH_STR=$(echo "$match" | awk '{print $3}')
+                  MATCHES="${MATCHES}- ${PCT} similar to \`${PATH_STR}\`\n"
+                fi
+              done <<< "$RESULT"
+            fi
+          done <<< "${{ steps.changed.outputs.files }}"
+          echo "::endgroup::"
+          if [ -n "$MATCHES" ]; then
+            echo "duplicate_matches<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$MATCHES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post consolidated review comment
+        if: steps.changed.outputs.no_files != 'true' && (success() || failure())
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const schemaFailures = `${{ steps.schema.outputs.schema_failures }}`;
+            const markdownIssues = `${{ steps.markdown.outputs.markdown_issues }}`;
+            const injectionWarnings = `${{ steps.injection.outputs.injection_warnings }}`;
+            const duplicateMatches = `${{ steps.duplicates.outputs.duplicate_matches }}`;
+
+            const schemaPass = !schemaFailures.trim();
+            const markdownPass = !markdownIssues.trim();
+            const injectionPass = !injectionWarnings.trim();
+            const duplicatesPass = !duplicateMatches.trim();
+
+            let body = '## Tier 1 — Automated validation\n\n';
+            body += `| Check | Result |\n|---|---|\n`;
+            body += `| Schema validation | ${schemaPass ? '✅ pass' : '❌ fail'} |\n`;
+            body += `| Secret scanning | Check the Gitleaks step for details |\n`;
+            body += `| Markdown lint | ${markdownPass ? '✅ pass' : '⚠️ issues'} |\n`;
+            body += `| Prompt injection patterns | ${injectionPass ? '✅ clean' : '⚠️ review needed'} |\n`;
+            body += `| Duplicate detection | ${duplicatesPass ? '✅ no matches' : 'ℹ️ see below'} |\n\n`;
+
+            if (!schemaPass) {
+              body += `### ❌ Schema failures (blocks merge)\n${schemaFailures}\n`;
+            }
+            if (!markdownPass) {
+              body += `### ⚠️ Markdown issues\n<details><summary>Click to expand</summary>\n\n\`\`\`\n${markdownIssues}\n\`\`\`\n</details>\n\n`;
+            }
+            if (!injectionPass) {
+              body += `### ⚠️ Prompt injection patterns detected\nThese are warnings, not hard failures. A reviewer can override if this is intentional.\n\n${injectionWarnings}\n`;
+            }
+            if (!duplicatesPass) {
+              body += `### ℹ️ Similar existing skills\n${duplicateMatches}\n`;
+            }
+
+            body += '\n---\n*Automated by Tier 1 validation workflow.*';
+
+            // Find and update existing comment, or create new
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Tier 1 — Automated validation')
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                comment_id: existing.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            }
+
+      - name: Fail if schema check failed
+        if: steps.schema.outputs.schema_failures != ''
+        run: |
+          echo "Schema validation failed; blocking merge."
+          exit 1
