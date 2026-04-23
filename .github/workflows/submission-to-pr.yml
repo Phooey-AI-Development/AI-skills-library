@@ -23,23 +23,60 @@ jobs:
           template-path: .github/ISSUE_TEMPLATE/submit-skill.yml
 
       - name: Validate skill name format
+        id: validate
+        env:
+          SKILL_NAME: ${{ steps.parse.outputs.issueparser_skill-name }}
         run: |
-          SKILL_NAME="${{ steps.parse.outputs.issueparser_skill-name }}"
+          ERRORS=""
           if [[ ! "$SKILL_NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-            echo "::error::Skill name must be lowercase letters, digits, and hyphens only"
-            exit 1
+            ERRORS="Skill name must contain only lowercase letters, digits, and hyphens (no spaces, no capital letters, no special characters). You submitted: \`$SKILL_NAME\`"
+          elif [[ ${#SKILL_NAME} -gt 64 ]]; then
+            ERRORS="Skill name must be 64 characters or fewer. You submitted a name with ${#SKILL_NAME} characters."
+          elif [[ -d "skills/$SKILL_NAME" ]]; then
+            ERRORS="A skill named \`$SKILL_NAME\` already exists in the library. Please pick a more specific or differentiated name and submit again."
           fi
-          if [[ ${#SKILL_NAME} -gt 64 ]]; then
-            echo "::error::Skill name must be 64 characters or fewer"
-            exit 1
+
+          if [ -n "$ERRORS" ]; then
+            echo "validation_error<<EOF" >> $GITHUB_OUTPUT
+            echo "$ERRORS" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            echo "failed=true" >> $GITHUB_OUTPUT
+            echo "::error::$ERRORS"
+          else
+            echo "skill_name=$SKILL_NAME" >> $GITHUB_OUTPUT
+            echo "failed=false" >> $GITHUB_OUTPUT
           fi
-          if [[ -d "skills/$SKILL_NAME" ]]; then
-            echo "::error::A skill with this name already exists"
-            exit 1
-          fi
-          echo "skill_name=$SKILL_NAME" >> $GITHUB_OUTPUT
+
+      - name: Comment on issue if validation failed
+        if: steps.validate.outputs.failed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const errorMsg = `${{ steps.validate.outputs.validation_error }}`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: [
+                '⚠️ **Your submission couldn\'t be processed automatically.**',
+                '',
+                errorMsg,
+                '',
+                '---',
+                '**What to do next:**',
+                '1. Open a new submission with the correction — [click here to submit again](../../issues/new?template=submit-skill.yml).',
+                '2. You can close this issue; no further action is needed here.',
+                '',
+                'If you think this is a mistake, comment below and a reviewer will take a look.'
+              ].join('\n'),
+            });
+
+      - name: Stop if validation failed
+        if: steps.validate.outputs.failed == 'true'
+        run: exit 1
 
       - name: Create SKILL.md
+        if: steps.validate.outputs.failed != 'true'
         env:
           SKILL_NAME: ${{ steps.parse.outputs.issueparser_skill-name }}
           DESCRIPTION: ${{ steps.parse.outputs.issueparser_description }}
@@ -70,6 +107,7 @@ jobs:
           SKILL_EOF
 
       - name: Create pull request
+        if: steps.validate.outputs.failed != 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           branch: submission/issue-${{ github.event.issue.number }}
@@ -90,12 +128,13 @@ jobs:
             - [ ] Category and occupation are appropriate
             - [ ] Status upgraded from `draft` to `approved` if ready for production
 
-            Closes #${{ github.event.issue.number }}
+            From #${{ github.event.issue.number }}
           labels: |
             skill-submission
             needs-review
 
-      - name: Comment on original issue
+      - name: Comment on issue with PR link
+        if: steps.validate.outputs.failed != 'true'
         uses: actions/github-script@v7
         with:
           script: |
